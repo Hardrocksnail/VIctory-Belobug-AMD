@@ -79,6 +79,18 @@ NVIDIA (hosts without 64-lane waves):
   the opening scene: no draw dropped for want of a table (4,992 before),
   dropped draws 303 a frame on average instead of 1,308, and indirect
   ones 210 instead of 3,379. A world frame used 150,000 to 180,000 slots.
+- Division by constants (thread ids split by the group's size, structured
+  buffer offsets, record counts) is emitted as shifts or a multiply, never
+  `udiv`/`urem`: NVIDIA's DXIL compiler crashes on those inside
+  `CreateComputePipelineState` (a null dereference reported as
+  E_OUTOFMEMORY; found by
+  [project-flamingo](https://github.com/JMAN730/project-flamingo)). Every one
+  of the 108 compute pipelines the RTX 4060 had refused in the world (tiled
+  and deferred lighting, exposure, ray-traced shadows, indirect light,
+  materials) now builds. `victory translate --pipelines` with
+  `VICTORY_ADAPTER=nvidia`, `VICTORY_PIPELINE_STAGES=cs` and
+  `VICTORY_ONLY_HASHES=<hash or name part>,...` checks such shaders on the
+  host's compiler without running the title.
 
 Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
 shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces

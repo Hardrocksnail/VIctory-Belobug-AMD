@@ -67,6 +67,28 @@ fn subword_load(rest: &str) -> Option<(u32, bool, Option<u32>)> {
     Some((width, signed, half))
 }
 
+/// Unsigned division of every 32-bit value by the constant `d` (2 or more,
+/// not a power of two) with a multiply, after Granlund and Montgomery
+/// ("Division by invariant integers using multiplication", 1994, fig. 4.1):
+/// `t = mulhi(n, m)`, `q = (t + ((n - t) >> sh1)) >> sh2`. Returns
+/// `(m, sh1, sh2)`.
+fn div_magic(d: u32) -> (u32, u32, u32) {
+    debug_assert!(d >= 2 && !d.is_power_of_two());
+    let l = 32 - (d - 1).leading_zeros();
+    let m = ((1u64 << 32) * ((1u64 << l) - u64::from(d))) / u64::from(d) + 1;
+    (m as u32, l.min(1), l.saturating_sub(1))
+}
+
+/// The high word of `a * b` from 16-bit halves, as [`Lower::mulhi_halves`]
+/// emits it.
+#[cfg(test)]
+fn mulhi_halves(a: u32, b: u32) -> u32 {
+    let (a_lo, a_hi, b_lo, b_hi) = (a & 0xFFFF, a >> 16, b & 0xFFFF, b >> 16);
+    let (p0, p1, p2, p3) = (a_lo * b_lo, a_lo * b_hi, a_hi * b_lo, a_hi * b_hi);
+    let mid = (p0 >> 16) + (p1 & 0xFFFF) + (p2 & 0xFFFF);
+    p3 + (p1 >> 16) + (p2 >> 16) + (mid >> 16)
+}
+
 fn ds_integer_atomic(name: &str) -> Option<(&str, bool, u8)> {
     let (op, ty) = name.strip_prefix("ds_")?.rsplit_once('_')?;
     let op = op.strip_suffix("_rtn").unwrap_or(op);
@@ -4344,15 +4366,74 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let f = self.console_flat();
-        let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
-            0 => self.s.m.bin(e, Bin::URem, f, xk),
+            0 => self.udiv_const(e, f, x).1,
             1 => {
-                let t = self.s.m.bin(e, Bin::UDiv, f, xk);
-                self.s.m.bin(e, Bin::URem, t, yk)
+                let t = self.udiv_const(e, f, x).0;
+                self.udiv_const(e, t, y).1
             }
-            _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+            _ => self.udiv_const(e, f, x * y).0,
         })
+    }
+
+    /// `(n / d, n % d)` for a constant `d`, without `udiv` or `urem`:
+    /// NVIDIA's DXIL compiler (nvgpucomp64.dll) dereferences a null pointer
+    /// on them and reports E_OUTOFMEMORY when the pipeline is made (found
+    /// by project-flamingo, github.com/JMAN730/project-flamingo; every
+    /// compute shader the RTX 4060's compiler refused had them). Powers of
+    /// two shift and mask; other divisors multiply ([`div_magic`]), with the
+    /// high word made from 16-bit halves since NVIDIA fails on the 32x32
+    /// multiply with a high result too.
+    fn udiv_const(&mut self, at: usize, n: V, d: u32) -> (V, V) {
+        if let Some(k) = self.s.m.int_value(n) {
+            let k = k as u32;
+            return (self.s.m.i32(k / d.max(1)), self.s.m.i32(k % d.max(1)));
+        }
+        if d <= 1 {
+            return (n, self.s.m.i32(0));
+        }
+        if d.is_power_of_two() {
+            let (sh, mask) = (self.s.m.i32(d.trailing_zeros()), self.s.m.i32(d - 1));
+            return (
+                self.s.m.bin(at, Bin::LShr, n, sh),
+                self.s.m.bin(at, Bin::And, n, mask),
+            );
+        }
+        let (m, sh1, sh2) = div_magic(d);
+        let m = self.s.m.i32(m);
+        let t = self.mulhi_halves(at, n, m);
+        let (sh1, sh2) = (self.s.m.i32(sh1), self.s.m.i32(sh2));
+        let rest = self.s.m.bin(at, Bin::Sub, n, t);
+        let rest = self.s.m.bin(at, Bin::LShr, rest, sh1);
+        let q = self.s.m.bin(at, Bin::Add, t, rest);
+        let q = self.s.m.bin(at, Bin::LShr, q, sh2);
+        let dk = self.s.m.i32(d);
+        let whole = self.s.m.bin(at, Bin::Mul, q, dk);
+        (q, self.s.m.bin(at, Bin::Sub, n, whole))
+    }
+
+    /// The high word of `a * b` (32-bit values) from 16-bit halves.
+    fn mulhi_halves(&mut self, at: usize, a: V, b: V) -> V {
+        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+        let a_lo = self.s.m.bin(at, Bin::And, a, low);
+        let a_hi = self.s.m.bin(at, Bin::LShr, a, k16);
+        let b_lo = self.s.m.bin(at, Bin::And, b, low);
+        let b_hi = self.s.m.bin(at, Bin::LShr, b, k16);
+        let p0 = self.s.m.bin(at, Bin::Mul, a_lo, b_lo);
+        let p1 = self.s.m.bin(at, Bin::Mul, a_lo, b_hi);
+        let p2 = self.s.m.bin(at, Bin::Mul, a_hi, b_lo);
+        let p3 = self.s.m.bin(at, Bin::Mul, a_hi, b_hi);
+        let p0_hi = self.s.m.bin(at, Bin::LShr, p0, k16);
+        let p1_lo = self.s.m.bin(at, Bin::And, p1, low);
+        let p2_lo = self.s.m.bin(at, Bin::And, p2, low);
+        let mid = self.s.m.bin(at, Bin::Add, p0_hi, p1_lo);
+        let mid = self.s.m.bin(at, Bin::Add, mid, p2_lo);
+        let mid_hi = self.s.m.bin(at, Bin::LShr, mid, k16);
+        let p1_hi = self.s.m.bin(at, Bin::LShr, p1, k16);
+        let p2_hi = self.s.m.bin(at, Bin::LShr, p2, k16);
+        let hi = self.s.m.bin(at, Bin::Add, p3, p1_hi);
+        let hi = self.s.m.bin(at, Bin::Add, hi, p2_hi);
+        self.s.m.bin(at, Bin::Add, hi, mid_hi)
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -6016,16 +6097,13 @@ impl<'a> Lower<'a> {
         if let Some(stride) = raw {
             let not3 = self.s.m.i32(!3);
             let addr = self.s.m.bin(c, Bin::And, addr, not3);
-            let st = (stride != 0).then(|| self.s.m.i32(stride));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let (idx, elem_off) = match st {
-                    Some(st) => (
-                        self.s.m.bin(c, Bin::UDiv, a, st),
-                        self.s.m.bin(c, Bin::URem, a, st),
-                    ),
-                    None => (a, self.s.m.undef(self.s.t.i32)),
+                let (idx, elem_off) = if stride != 0 {
+                    self.udiv_const(c, a, stride)
+                } else {
+                    (a, self.s.m.undef(self.s.t.i32))
                 };
                 let mask = self.s.m.i8(1);
                 let al = self.s.m.i32(4);
@@ -6477,8 +6555,7 @@ impl<'a> Lower<'a> {
             None => {
                 let mut n = field(self, 0);
                 if let Some(stride) = records {
-                    let st = self.s.m.i32(stride);
-                    n = self.s.m.bin(c, Bin::UDiv, n, st);
+                    n = self.udiv_const(c, n, stride).0;
                 }
                 vec![(2, n)]
             }
@@ -15070,6 +15147,39 @@ mod tests {
                 per_lane_only: false,
             })
             .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod division_tests {
+    /// What `Lower::udiv_const` emits, computed on the CPU.
+    fn emitted(n: u32, d: u32) -> u32 {
+        if d.is_power_of_two() {
+            return n >> d.trailing_zeros();
+        }
+        let (m, sh1, sh2) = super::div_magic(d);
+        let t = super::mulhi_halves(n, m);
+        (t + ((n - t) >> sh1)) >> sh2
+    }
+
+    #[test]
+    fn constant_division_without_udiv_is_exact() {
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u32
+        };
+        let divisors = (1..=4100_u32).chain([
+            6, 12, 20, 24, 36, 48, 52, 1_000_003, 0x7FFF_FFFF, 0x8000_0001, 0xFFFF_FFFE, u32::MAX,
+        ]);
+        for d in divisors {
+            let edges = [0, 1, d - 1, d, d.wrapping_add(1), 0x7FFF_FFFF, 0x8000_0000, u32::MAX - 1, u32::MAX];
+            for n in edges.into_iter().chain((0..300).map(|_| next())) {
+                assert_eq!(emitted(n, d), n / d, "{n} / {d}");
+            }
         }
     }
 }
