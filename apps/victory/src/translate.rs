@@ -346,10 +346,21 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail("corrupt record".into(), || {
+            format!("{}{}", path.display(), source.label())
+        });
     };
+    // The runtime names a shader by the first 16 hex digits of its
+    // container's blake3; `VICTORY_ONLY_HASHES=<hash or name part>,...`
+    // keeps those and the containers whose label holds a name part.
+    let short = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    if only_hashes().is_some_and(|only| {
+        !only.contains(&short) && !only.iter().any(|n| source.label().contains(n.as_str()))
+    }) {
+        return;
+    }
+    let example = || format!("{}{} [{short}]", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -497,6 +508,17 @@ fn translate(
     }
 }
 
+/// The shaders `VICTORY_ONLY_HASHES` names, if it is set.
+fn only_hashes() -> Option<&'static HashSet<String>> {
+    static ONLY: std::sync::OnceLock<Option<HashSet<String>>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| {
+        std::env::var("VICTORY_ONLY_HASHES")
+            .ok()
+            .map(|v| v.split(',').map(|h| h.trim().to_owned()).collect())
+    })
+    .as_ref()
+}
+
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
@@ -520,7 +542,16 @@ fn check(
             &shader.dxil,
         );
     }
-    if let Some((h, stub_ps)) = &checks.host {
+    // `VICTORY_PIPELINE_STAGES=cs,ms,...`: only those stages' pipelines
+    // (`vs`, `ps`, `cs`, `ms`), when making each takes the host's compiler
+    // long.
+    let stage_wanted = std::env::var("VICTORY_PIPELINE_STAGES").map_or(true, |s| {
+        let name = format!("{:?}", shader.stage).to_lowercase();
+        s.split(',').any(|x| x.trim().eq_ignore_ascii_case(&name))
+    });
+    if let Some((h, stub_ps)) = &checks.host
+        && stage_wanted
+    {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
