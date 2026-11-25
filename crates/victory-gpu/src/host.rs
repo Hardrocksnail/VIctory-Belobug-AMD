@@ -458,13 +458,17 @@ impl Host {
 }
 
 /// The adapter Windows ranks fastest, so a machine with an integrated GPU
-/// too runs on its discrete one.
+/// too runs on its discrete one. `VICTORY_ADAPTER` picks the first hardware
+/// adapter whose description holds it instead (ignoring case: `nvidia`,
+/// `radeon`, `780m`...), as it does for the shader tests.
 fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-        let adapter: IDXGIAdapter1 =
-            factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+        let adapter: IDXGIAdapter1 = match std::env::var("VICTORY_ADAPTER") {
+            Ok(name) if !name.is_empty() => named_adapter(&factory, &name)?,
+            _ => factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?,
+        };
         let desc = adapter.GetDesc1()?;
         let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         tracing::info!(
@@ -473,6 +477,33 @@ fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
             "host adapter"
         );
         Ok(adapter)
+    }
+}
+
+/// The first hardware adapter whose description holds `name`, ignoring case.
+fn named_adapter(factory: &IDXGIFactory6, name: &str) -> windows::core::Result<IDXGIAdapter1> {
+    let want = name.to_lowercase();
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let mut i = 0;
+        loop {
+            // Past the last adapter this fails with DXGI_ERROR_NOT_FOUND.
+            let adapter = match factory.EnumAdapters1(i) {
+                Ok(adapter) => adapter,
+                Err(e) => {
+                    tracing::error!(name, "VICTORY_ADAPTER names no hardware adapter");
+                    return Err(e);
+                }
+            };
+            let desc = adapter.GetDesc1()?;
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                && String::from_utf16_lossy(&desc.Description[..end]).to_lowercase().contains(&want)
+            {
+                return Ok(adapter);
+            }
+            i += 1;
+        }
     }
 }
 
