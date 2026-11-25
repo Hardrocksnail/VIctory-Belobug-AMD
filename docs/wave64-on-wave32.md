@@ -1,10 +1,16 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
-read only their own half run as two 32-lane waves. Groups of one console
-wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+Status: steps 1, 2, 4 and 5 are in, and of step 6 the one-wave part. On
+NVIDIA, wave64 programs whose lanes read only their own half run as two
+32-lane waves. Groups of one console wave also run in the console flow:
+masks read whole, lanes of the other half, divergent branches and loops,
+LDS shared within the wave, and whole-wave sections. Still open: groups of
+several console waves and `ds_(b)permute`.
+
+Measured with `victory translate --host-lanes 32-32 --validate` over
+Grand Theft Auto VI 1.0.2.1: 2,712 of 2,763 compute programs translate
+(2,459 before the one-wave part of step 6), every one validated. Of the
+51 left, 50 are groups of 128 to 1,024 threads; one uses `v_permlane16` outside a section.
 
 ## The problem
 
@@ -113,8 +119,22 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
-whole-wave sections.
+waves, at most 64 threads per group, and no `ds_(b)permute`; it reads
+console lanes or shares LDS within the wave.
+
+- **LDS within one wave** (`Lower::lds_half_sync`): the console wave runs
+  each LDS instruction in all its lanes before the next, so its compiler
+  leaves out barriers between them. The halves meet at a group barrier
+  after every LDS access instead. Every thread of the group reaches it,
+  since the halves take the same branches; a group of 32 threads or fewer
+  has one half and no barrier.
+- **Whole-wave sections** (`Lower::halves`): a value a section leaves is
+  still made by a DXIL wave operation, which covers one half. A reduction
+  exchanges the halves' results and combines them with its operation; a
+  prefix sum in the upper half adds the lower half's total, exchanged.
+  64-bit float sums exchange both words of each half's sum. A half with
+  no lane in the section gives the operation's identity, as on the
+  console.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
@@ -169,7 +189,8 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then one-wave LDS sharing.
+6. ~~One-wave LDS sharing and whole-wave sections in halves.~~ Multi-wave
+   groups (counters) remain.
 
 ## Credit
 

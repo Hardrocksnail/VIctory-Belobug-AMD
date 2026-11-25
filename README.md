@@ -60,6 +60,19 @@ AMD:
 - Buffer element counts come from the host's own table, not a size query the
   driver's compiler crashes on.
 
+NVIDIA (hosts without 64-lane waves):
+- The console's wave64 compute programs of one wave per group that share
+  LDS within the wave or use whole-wave sections (wave reductions, prefix
+  sums) run as two 32-lane halves in the console flow
+  ([docs/wave64-on-wave32.md](docs/wave64-on-wave32.md)). Among them are
+  the tiled lighting's depth and material tiles, the shadow masks, the
+  ambient map and indirect light. 2,712 of the title's 2,763 compute
+  programs now translate for a 32-lane host, up from 2,459, all accepted
+  by the DXIL validator; the rest are groups of several console waves.
+- `VICTORY_ADAPTER=<part of the adapter's name>` picks the GPU the title
+  runs on, as it already did for the shader tests (for example `780M` for
+  an integrated Radeon next to an NVIDIA card).
+
 Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
 shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
 shader containers by files, `VICTORY_ALWAYS_COPY=1` refreshes every copy of

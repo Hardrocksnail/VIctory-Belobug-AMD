@@ -394,3 +394,141 @@ fn loops_with_an_exit_mask_grown_from_zero() {
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
 }
+
+/// [`console_flow_case`] for a program with one 512-byte LDS granule.
+fn lds_flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32) {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let mut p = program(body, threads);
+        p.io = StageIo::Cs(crate::native::ComputeIo {
+            rsrc2: 1 << 1 | 1 << 7 | 1 << 15,
+            threads: [threads, 1, 1],
+        });
+        let split = !host.target().runs(64);
+        let groups = 2;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();
+        assert_eq!(
+            out, expect,
+            "{name}: {label}, {threads} threads (split {split})"
+        );
+        eprintln!("{name}: {label}, {threads} threads exact (split {split})");
+    }
+}
+
+/// LDS shared within one console wave, which the console compiler leaves
+/// without barriers (one wave runs its LDS instructions in order): lane t
+/// writes t + 64 at dword t, then reads dword t ^ 32, which a lane of the
+/// other half wrote. In halves, the two meet after each LDS access.
+#[test]
+fn lds_within_one_console_wave_crosses_halves() {
+    let body = [
+        0x4A02_00C0, // v_add_nc_u32 v1, 64, v0
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD834_0000,
+        0x0000_0103, // ds_write_b32 v3, v1
+        0xD8D8_0000,
+        0x0200_0004, // ds_read_b32 v2, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    lds_flow_case("LDS dword t ^ 32", &body, 64, |t| (t ^ 32) + 64);
+}
+
+/// A whole-wave section as the console expands `WaveActiveSum(v0)`: each
+/// half of 32 summed with DPP and `v_permlanex16`, then lanes 0 and 32 read
+/// and added. In halves, each host wave sums its half and the halves
+/// exchange their sums. v1 and v5 are the section's.
+const SECTION_SUM: [u32; 20] = [
+    0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+    0xD501_0001,
+    0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s[0:1]
+    0x4A02_02FA,
+    0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+    0x4A02_02FA,
+    0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+    0x4A02_02FA,
+    0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+    0x4A02_02FA,
+    0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+    0xD778_0005,
+    0x0305_8301, // v_permlanex16_b32 v5, v1, -1, -1
+    0x4A02_0B01, // v_add_nc_u32_e32 v1, v1, v5
+    0xD760_0002,
+    0x0001_0101, // v_readlane_b32 s2, v1, 0
+    0xD760_0003,
+    0x0001_4101, // v_readlane_b32 s3, v1, 32
+    0x8002_0302, // s_add_u32 s2, s2, s3
+    0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+];
+
+#[test]
+fn whole_wave_sums_cover_both_halves() {
+    let mut body = SECTION_SUM.to_vec();
+    body.push(0x7E04_0202); // v_mov_b32 v2, s2
+    console_flow_case("WaveActiveSum(t)", &body, 64, |_| 2016);
+    // 48 threads: the upper half is partial.
+    console_flow_case("WaveActiveSum(t)", &body, 48, |_| 1128);
+    // 32 threads: no upper half at all.
+    console_flow_case("WaveActiveSum(t)", &body, 32, |_| 496);
+    // Inside a branch lanes below 40 take: the sum of their ids.
+    let mut branch = vec![
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0015, // s_cbranch_execz +21
+    ];
+    branch.extend(SECTION_SUM);
+    branch.extend([
+        0x7E04_0202, // v_mov_b32 v2, s2
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ]);
+    console_flow_case("if (t < 40) WaveActiveSum(t)", &branch, 64, |t| {
+        if t < 40 { 780 } else { 1 }
+    });
+}
+
+/// `WaveActiveMin(v0)` in a branch only lanes above 39 take: the lower half
+/// has no lane there and gives the identity (all ones), which must not be
+/// taken for a value.
+#[test]
+fn whole_wave_minimum_of_an_empty_half_is_its_identity() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D82_00A7, // v_cmp_lt_u32 vcc, 39, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0015, // s_cbranch_execz +21
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_00C1, // v_cndmask_b32_e64 v1, -1, v0, s[0:1]
+        0x2602_02FA,
+        0xFF01_6101, // v_min_u32_dpp v1, v1, v1 row_xmask:1
+        0x2602_02FA,
+        0xFF01_6201, // v_min_u32_dpp v1, v1, v1 row_xmask:2
+        0x2602_02FA,
+        0xFF01_6401, // v_min_u32_dpp v1, v1, v1 row_xmask:4
+        0x2602_02FA,
+        0xFF01_6801, // v_min_u32_dpp v1, v1, v1 row_xmask:8
+        0xD778_0005,
+        0x0305_8301, // v_permlanex16_b32 v5, v1, -1, -1
+        0x2602_0B01, // v_min_u32_e32 v1, v1, v5
+        0xD760_0002,
+        0x0001_0101, // v_readlane_b32 s2, v1, 0
+        0xD760_0003,
+        0x0001_4101, // v_readlane_b32 s3, v1, 32
+        0x8382_0302, // s_min_u32 s2, s2, s3
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E04_0202, // v_mov_b32 v2, s2
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (t > 39) WaveActiveMin(t)", &body, 64, |t| {
+        if t > 39 { 40 } else { 1 }
+    });
+}

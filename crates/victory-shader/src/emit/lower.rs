@@ -1191,17 +1191,18 @@ impl<'a> Lower<'a> {
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
-            // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
+            // (masks read whole, lanes of the other half, whole-wave
+            // sections' results): the console flow, for a group of one
+            // console wave. So does LDS shared within that wave, which the
+            // console compiler leaves without barriers: in the console flow
+            // the halves meet after each LDS access (`lds_half_sync`).
+            wants_console_flow = (console_lanes || one_wave && s.lds_dwords > 0)
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute"));
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -1822,6 +1823,29 @@ impl<'a> Lower<'a> {
                     .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, u0]);
                 let i32t = self.s.t.i32;
                 let pair = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+                if self.split && !self.console_cf {
+                    return Err("a wave reduction in a wave64 program split in halves");
+                }
+                let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+                let sum = if self.split && threads > 32 {
+                    // Each half summed its lanes: both words of each half's
+                    // sum exchanged, then the two sums added.
+                    let own = self
+                        .s
+                        .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[sum]);
+                    let (w0, w1) = (self.s.m.extract(c, own, 0), self.s.m.extract(c, own, 1));
+                    let (lo0, hi0) = self.exchange(c, w0);
+                    let (lo1, hi1) = self.exchange(c, w1);
+                    let lower = self
+                        .s
+                        .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo0, lo1]);
+                    let upper = self
+                        .s
+                        .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[hi0, hi1]);
+                    self.s.m.bin(c, Bin::Add, lower, upper)
+                } else {
+                    sum
+                };
                 let split = self
                     .s
                     .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[sum]);
@@ -1847,7 +1871,9 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        // Two halves of a console wave combine their results only in the
+        // console flow, where every thread reaches the exchange (`halves`).
+        if self.split && !self.console_cf {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -1922,6 +1948,11 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        let r = if self.split {
+            self.halves(op, prefix, float, arg, r)
+        } else {
+            r
+        };
         Ok(if f16 {
             self.s
                 .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
@@ -1930,6 +1961,68 @@ impl<'a> Lower<'a> {
         } else {
             r
         })
+    }
+
+    /// Console flow in halves: a wave operation over the host wave `r` (of
+    /// `arg`, f32 when `float`) covers one half of the console wave. A
+    /// reduction takes the other half's result too; a prefix in the upper
+    /// half adds the lower half's total. A group of 32 threads or fewer has
+    /// no upper half.
+    fn halves(&mut self, op: super::wave::Op, prefix: Option<bool>, float: bool, arg: V, r: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if threads <= 32 {
+            return r;
+        }
+        let word = |l: &mut Self, x: V| if float { l.as_int(x) } else { x };
+        let value = |l: &mut Self, x: V| if float { l.as_float(x) } else { x };
+        if prefix.is_some() {
+            // Sums only (others were refused): the lower half's total.
+            let (sfx, ty) = if float {
+                ("f32", self.s.t.f32)
+            } else {
+                ("i32", self.s.t.i32)
+            };
+            let (k0, u) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+            let total = self.s.op(
+                c,
+                &format!("waveActiveOp.{sfx}"),
+                Attr::NoUnwind,
+                ty,
+                119,
+                &[arg, k0, u],
+            );
+            let t = word(self, total);
+            let (lower, _) = self.exchange(c, t);
+            let lower = value(self, lower);
+            let (_, half) = self.console_lane();
+            let z = self.s.m.i32(0);
+            let upper = self.s.m.cmp(c, pred::NE, half, z);
+            let carried = self.s.m.bin(c, Bin::Add, r, lower);
+            return self.s.m.select(c, upper, carried, r);
+        }
+        let w = word(self, r);
+        let (lo, hi) = self.exchange(c, w);
+        let (lo, hi) = (value(self, lo), value(self, hi));
+        match op {
+            Op::AddU | Op::AddF | Op::AddF16 => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+            Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+            Op::MinF => self.max_min(false, lo, hi),
+            Op::MaxF => self.max_min(true, lo, hi),
+            Op::MinU | Op::MaxU | Op::MinI | Op::MaxI => {
+                let p = match op {
+                    Op::MaxI => pred::SGT,
+                    Op::MinI => pred::SLT,
+                    Op::MaxU => pred::IUGT,
+                    _ => pred::IULT,
+                };
+                let first = self.s.m.cmp(c, p, lo, hi);
+                self.s.m.select(c, first, lo, hi)
+            }
+        }
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -4900,6 +4993,31 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Console flow in halves: the console wave runs each LDS instruction in
+    /// all its lanes before the next, so its compiler leaves out barriers
+    /// between lanes of one wave. Here the halves are two host waves: they
+    /// meet after every LDS access, which every thread of the group reaches
+    /// (the group is one console wave whose halves take the same branches,
+    /// see [`CONSOLE_FLOW`]). A group of 32 threads or fewer has one half.
+    fn lds_half_sync(&mut self, name: &str) {
+        if !(self.console_cf && self.split)
+            || name == "ds_nop"
+            || name.starts_with("ds_swizzle")
+            || name.contains("permute")
+        {
+            return;
+        }
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if threads <= 32 {
+            return;
+        }
+        // Thread-group sync with a group-shared memory fence.
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn write_atomic_result(&mut self, inst: &Inst, reg: u8, old: V, wide: bool, guard: Option<V>) {
         if wide {
             let (lo, hi) = self.split64(old);
@@ -4995,7 +5113,7 @@ impl<'a> Lower<'a> {
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
-            Fields::Ds { .. } => self.ds(inst, b, i),
+            Fields::Ds { .. } => self.ds(inst, b, i).map(|()| self.lds_half_sync(name)),
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } if name.starts_with("scratch_") => self.scratch(inst, b, i),
             // Generic addresses: private, shared or global memory by aperture.
