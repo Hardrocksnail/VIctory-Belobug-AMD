@@ -509,9 +509,20 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
-/// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// The dynamic reserve when the host caps the whole view heap at
+/// [`PORTABLE_VIEWS`] (NVIDIA), taken from the title's slots. With 2^16 a
+/// world frame on an RTX 4060 held 55,000 to 61,000 of them, and draws
+/// whose constant tables found none were dropped by the thousand; 2^18
+/// keeps 736,832 title slots instead of 933,440 (the title spreads its
+/// views over its whole heap, so some more are left out).
+/// `VICTORY_DYNAMIC_CAPPED=<slots>` sets it, from 4,096 to half the heap.
+fn dynamic_capped() -> u32 {
+    const DEFAULT: u32 = 1 << 18;
+    std::env::var("VICTORY_DYNAMIC_CAPPED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(DEFAULT, |n| n.clamp(1 << 12, PORTABLE_VIEWS / 2))
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -583,17 +594,19 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                let dynamic = dynamic_capped();
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = PORTABLE_VIEWS - dynamic,
+                    lost = (wanted + dynamic).saturating_sub(PORTABLE_VIEWS),
+                    dynamic,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
+                    PORTABLE_VIEWS - dynamic - crate::memory::SLOTS,
+                    dynamic,
                 )
             }
             Err(e) => {

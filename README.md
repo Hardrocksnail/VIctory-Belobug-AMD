@@ -72,6 +72,13 @@ NVIDIA (hosts without 64-lane waves):
 - `VICTORY_ADAPTER=<part of the adapter's name>` picks the GPU the title
   runs on, as it already did for the shader tests (for example `780M` for
   an integrated Radeon next to an NVIDIA card).
+- NVIDIA caps the view heap at 1,000,000 slots. Of those, the tables made
+  per command list (constants, shader resources) now get 262,144 instead
+  of 65,536, taken from the title's slots (736,832 kept instead of
+  933,440); `VICTORY_DYNAMIC_CAPPED=<slots>` sets it. On an RTX 4060 in
+  the opening scene: no draw dropped for want of a table (4,992 before),
+  dropped draws 303 a frame on average instead of 1,308, and indirect
+  ones 210 instead of 3,379. A world frame used 150,000 to 180,000 slots.
 
 Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
 shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
